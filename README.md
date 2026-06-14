@@ -31,19 +31,16 @@ Kindle's native `eips` framebuffer tool — no KOReader or extra runtime require
 
 ## Installation
 
-1. Copy the `KindleTRMNL` folder to your Kindle's extensions directory:
+1. [**Download the latest release**](https://github.com/AshleyThew/KindleTRMNL/archive/refs/heads/master.zip)
+   and extract it.
+
+2. Copy the `KindleTRMNL` folder to your Kindle's extensions directory:
 
    ```
    /mnt/us/extensions/KindleTRMNL/
    ```
 
-2. Edit `config.conf` and set at least `BYOS_URL` and `API_KEY` (see below).
-
-3. (Recommended) Lock down the config so your API key isn't world-readable:
-
-   ```sh
-   chmod 600 /mnt/us/extensions/KindleTRMNL/config.conf
-   ```
+3. Edit `config.conf` and set at least `BYOS_URL` and `API_KEY` (see below).
 
 4. Open **KUAL → TRMNL → Start TRMNL**.
 
