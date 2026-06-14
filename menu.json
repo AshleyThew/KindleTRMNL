@@ -1,0 +1,18 @@
+{
+  "items": [
+    {
+      "name": "TRMNL",
+      "priority": 1,
+      "items": [
+        {
+          "name": "Start TRMNL",
+          "action": "sh /mnt/us/extensions/KindleTRMNL/trmnl.sh"
+        },
+        {
+          "name": "Start TRMNL (no framework)",
+          "action": "sh /mnt/us/extensions/KindleTRMNL/trmnl.sh --framework_stop"
+        }
+      ]
+    }
+  ]
+}
