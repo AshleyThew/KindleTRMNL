@@ -6,7 +6,8 @@
 #   --detached      — actual daemon loop (forked from above)
 #   --autostart     — same as --detached; used by Upstart boot job
 #
-# Exits automatically when the power button is pressed or the screen is tapped.
+# Exits when the power button is pressed, or when the screen is tapped and the
+# on-screen quit prompt is confirmed with a second tap.
 #
 # Install path: /mnt/us/extensions/KindleTRMNL/trmnl.sh
 
@@ -18,6 +19,7 @@ CONFIG="$EXT_DIR/config.conf"
 LOG_FILE="$EXT_DIR/logs/trmnl.log"
 CACHE_DIR="$EXT_DIR/cache"
 LOCK_FILE="/tmp/trmnl.lock"
+PROMPT_LOCK="/tmp/trmnl_prompt.lock"  # present while a quit prompt is on screen
 FETCH_TMP="/tmp/trmnl_current.png"
 _FETCH_JSON="/tmp/trmnl_display.json"
 
@@ -55,38 +57,105 @@ _log_rotate_if_needed() {
 # WIFI
 # ═══════════════════════════════════════════════════════════════════════════════
 
+# Return 0 once the WiFi link is up AND has a usable IPv4 address.
+# An associated interface without an IP still can't fetch over HTTP, which is
+# the most common cause of a spurious "did not associate" fallback.
+_wifi_has_ip() {
+    local iface
+    for iface in wlan0 mlan0 wlan1; do
+        [ -d "/sys/class/net/$iface" ] || continue
+        # ip(8) is present on modern firmware; fall back to ifconfig otherwise.
+        if command -v ip >/dev/null 2>&1; then
+            local _addr
+            _addr=$(ip -4 addr show "$iface" 2>/dev/null)
+            if echo "$_addr" | grep -q 'inet '; then
+                local _ip
+                _ip=$(echo "$_addr" | grep 'inet ' | awk '{print $2}' | head -1)
+                log "DEBUG: _wifi_has_ip: $iface has IP $_ip"
+                return 0
+            fi
+        else
+            if ifconfig "$iface" 2>/dev/null | grep -Eq 'inet (addr:)?'; then
+                log "DEBUG: _wifi_has_ip: $iface up (ifconfig)"
+                return 0
+            fi
+        fi
+    done
+    log "DEBUG: _wifi_has_ip: no interface has IPv4 address"
+    return 1
+}
+
 wifi_enable() {
+    log "DEBUG: wifi_enable called (radio=$(wifi_radio_state))"
+    # Already fully connected (e.g. screensaver kept the radio on)? Done.
+    if wifi_is_connected && _wifi_has_ip; then
+        log "DEBUG: wifi_enable: already connected with IP -- skip"
+        return 0
+    fi
+
+    # Turn the radio on. This is idempotent: re-issuing it while already on does
+    # not disrupt an in-progress association, so we can safely re-assert it
+    # below without ever cutting power mid-connect.
+    log "INFO: WiFi enable: asserting wirelessEnable=1"
     lipc-set-prop com.lab126.cmd wirelessEnable 1 2>/dev/null
-    local timeout="${WIFI_TIMEOUT:-30}"
+
+    local timeout="${WIFI_TIMEOUT:-60}"
     local elapsed=0
     while [ "$elapsed" -lt "$timeout" ]; do
         local iface
         iface=$(lipc-get-prop com.lab126.cmd activeInterface 2>/dev/null)
         if [ "$iface" = "wifi" ]; then
             # Interface is selected, but the connection may not be fully
-            # established (no IP yet). Wait for the WiFi daemon to report a
-            # CONNECTED state before proceeding.
+            # established (no IP yet). Require a CONNECTED cmState (when the
+            # daemon exposes it) AND a real IPv4 address before proceeding.
             local cmstate
             cmstate=$(lipc-get-prop com.lab126.wifid cmState 2>/dev/null)
+            log "DEBUG: wifi_enable: elapsed=${elapsed}s iface=$iface cmState='${cmstate}'"
             case "$cmstate" in
-                CONNECTED|'') # '' = daemon doesn't expose cmState; accept iface=wifi
-                    # Some devices report "connected" before the network stack
-                    # is ready for HTTP. Give it a moment to stabilize so the
-                    # first fetch doesn't fail and fall back to the cached image.
-                    local settle="${NETWORK_SETTLE_SECS:-2}"
-                    [ "$settle" -gt 0 ] 2>/dev/null && sleep "$settle"
-                    return 0
+                CONNECTED|[Cc][Oo][Nn][Nn][Ee][Cc][Tt][Ee][Dd]|'') # '' = daemon doesn't expose cmState; accept iface=wifi
+                    if _wifi_has_ip; then
+                        # Some devices report "connected" before the network
+                        # stack is ready for HTTP. Give it a moment to settle so
+                        # the first fetch doesn't fall back to the cached image.
+                        local settle="${NETWORK_SETTLE_SECS:-2}"
+                        [ "$settle" -gt 0 ] 2>/dev/null && sleep "$settle"
+                        log "INFO: WiFi connected (${elapsed}s, settle=${settle}s)"
+                        return 0
+                    fi
+                    ;;
+                *)
+                    log "DEBUG: wifi_enable: cmState='$cmstate' -- waiting"
                     ;;
             esac
+        else
+            log "DEBUG: wifi_enable: elapsed=${elapsed}s activeInterface='${iface}' (not wifi yet)"
         fi
+
+        # Periodically re-assert the radio enable in case it was disabled
+        # (e.g. by a power-save event). This does NOT power-cycle the radio, so
+        # it never interrupts an association that is already underway.
+        if [ $(( elapsed % 10 )) -eq 0 ] && [ "$elapsed" -gt 0 ]; then
+            log "DEBUG: wifi_enable: re-asserting wirelessEnable=1 at ${elapsed}s"
+            lipc-set-prop com.lab126.cmd wirelessEnable 1 2>/dev/null
+        fi
+
         sleep 2
         elapsed=$(( elapsed + 2 ))
     done
+
+    log "WARN: WiFi did not connect within ${timeout}s (last iface=$(lipc-get-prop com.lab126.cmd activeInterface 2>/dev/null) cmState=$(lipc-get-prop com.lab126.wifid cmState 2>/dev/null))"
     return 1
 }
 
 wifi_disable() {
+    log "DEBUG: wifi_disable called"
     lipc-set-prop com.lab126.cmd wirelessEnable 0 2>/dev/null
+}
+
+# Report the current radio state: "1" = wireless enabled, "0" = off/airplane
+# mode. Empty if the property can't be read.
+wifi_radio_state() {
+    lipc-get-prop com.lab126.cmd wirelessEnable 2>/dev/null
 }
 
 wifi_is_connected() {
@@ -193,14 +262,19 @@ is_charging() {
 
 schedule_rtc_wake() {
     local seconds="$1"
+    log "DEBUG: schedule_rtc_wake: ${seconds}s from now"
     lipc-set-prop com.lab126.powerd rtcWakeup "$seconds" 2>/dev/null
 }
 
 deep_sleep() {
+    log "DEBUG: deep_sleep: disabling USB wakeup sources"
+    local _usb_count=0
     for _dev in /sys/bus/usb/devices/*/power/wakeup; do
-        [ -f "$_dev" ] && echo disabled > "$_dev" 2>/dev/null
+        [ -f "$_dev" ] && echo disabled > "$_dev" 2>/dev/null && _usb_count=$(( _usb_count + 1 ))
     done
+    log "DEBUG: deep_sleep: disabled $_usb_count USB wakeup source(s), writing mem to /sys/power/state"
     echo mem > /sys/power/state 2>/dev/null
+    log "DEBUG: deep_sleep: resumed from suspend"
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -217,8 +291,12 @@ get_screen_dimensions() {
         _SCREEN_W=$(echo "$info" | grep 'xres:' | head -1 | awk '{print $2}' | sed 's/^0*//')
         # yres is the 4th field in eips -i output ("yres:  <n>")
         _SCREEN_H=$(echo "$info" | grep 'yres:' | head -1 | awk '{print $4}' | sed 's/^0*//')
+        if [ -z "$_SCREEN_W" ] || [ -z "$_SCREEN_H" ]; then
+            log "WARN: get_screen_dimensions: eips -i returned no xres/yres (raw: $(echo "$info" | tr '\n' ' ' | cut -c1-120)) -- using defaults 758x1024"
+        fi
         _SCREEN_W="${_SCREEN_W:-758}"
         _SCREEN_H="${_SCREEN_H:-1024}"
+        log "DEBUG: screen dimensions: ${_SCREEN_W}x${_SCREEN_H}"
     fi
 }
 
@@ -261,8 +339,15 @@ display_battery_overlay() {
     local last="$2"
     local nxt="$3"
     get_screen_dimensions
-    local bottom_row=$(( _SCREEN_H / 18 - 1 ))
+    local bottom_row
+    if [ -n "$_SCREEN_H" ] && [ "$_SCREEN_H" -gt 0 ] 2>/dev/null; then
+        bottom_row=$(( _SCREEN_H / 18 - 1 ))
+    else
+        log "WARN: display_battery_overlay: _SCREEN_H empty or zero (eips -i failed?), using fallback row 55"
+        bottom_row=55
+    fi
     local status_line="Batt:${batt}%  Last:${last}  Next:${nxt}"
+    log "DEBUG: battery_overlay row=${bottom_row} line='${status_line}'"
     _eips_put 0 "$bottom_row" "$status_line"
 }
 
@@ -303,7 +388,8 @@ fetch_display_image() {
     # Ensure screen dimensions are populated for png-width/png-height headers.
     get_screen_dimensions
 
-    log "DEBUG: mac=$mac batt=${batt}% w=${_SCREEN_W:-758} h=${_SCREEN_H:-1024}"
+    log "DEBUG: fetch_display_image start: url=$url mac=$mac batt=${batt}% w=${_SCREEN_W:-758} h=${_SCREEN_H:-1024}"
+    [ -z "$mac" ] && log "WARN: fetch_display_image: MAC address is empty -- ID header will be blank"
 
     local http_code
     http_code=$(curl -s \
@@ -321,7 +407,8 @@ fetch_display_image() {
         "$url" 2>/dev/null)
 
     if [ "$http_code" != "200" ]; then
-        log "WARN: BYOS JSON fetch returned HTTP $http_code"
+        log "WARN: BYOS JSON fetch returned HTTP $http_code (url=$url)"
+        log "DEBUG: fetch_display_image: JSON response body (truncated): $(tr -d '\n' < "$_FETCH_JSON" 2>/dev/null | cut -c1-200)"
         _fetch_use_cache ; return $?
     fi
 
@@ -359,6 +446,7 @@ fetch_display_image() {
         log "INFO: Removed old image: $(basename "$_old")"
     done
 
+    log "DEBUG: fetch_display_image: downloading image url=$image_url dest=$dest"
     local img_code
     img_code=$(curl -s \
         -w "%{http_code}" \
@@ -375,8 +463,11 @@ fetch_display_image() {
         log "INFO: Image fetched OK (${sz} bytes) -> $filename"
         return 0
     else
+        log "WARN: Image download returned HTTP $img_code (url=$image_url)"
+        local dest_sz
+        dest_sz=$(wc -c < "$dest" 2>/dev/null | awk '{print $1}')
+        log "DEBUG: fetch_display_image: partial/bad download size=${dest_sz:-0} bytes -- discarding"
         rm -f "$dest"
-        log "WARN: Image download returned HTTP $img_code"
         _fetch_use_cache ; return $?
     fi
 }
@@ -433,6 +524,31 @@ _is_active_day() {
     echo "$days" | tr ',' '\n' | grep -qx "$dow"
 }
 
+_is_active_day_offset() {
+    local offset="$1"
+    local days="${REFRESH_DAYS:-}"
+    [ -z "$days" ] && return 0
+    local dow target_dow
+    dow=$(_current_dow)
+    target_dow=$(( (dow - 1 + offset) % 7 + 1 ))
+    echo "$days" | tr ',' '\n' | grep -qx "$target_dow"
+}
+
+_time_in_active_window_secs() {
+    local now_s="$1"
+    local window="${ACTIVE_HOURS:-00:00-23:59}"
+    local start end start_s end_s
+    start=$(echo "$window" | cut -d- -f1)
+    end=$(echo "$window"   | cut -d- -f2)
+    start_s=$(_hm_to_secs "$start")
+    end_s=$(_hm_to_secs "$end")
+    if [ "$start_s" -lt "$end_s" ]; then
+        [ "$now_s" -ge "$start_s" ] && [ "$now_s" -lt "$end_s" ]
+    else
+        [ "$now_s" -ge "$start_s" ] || [ "$now_s" -lt "$end_s" ]
+    fi
+}
+
 is_in_active_window() {
     _is_active_day || return 1
     local window="${ACTIVE_HOURS:-00:00-23:59}"
@@ -443,22 +559,38 @@ is_in_active_window() {
     now_s=$(_now_secs)
     start_s=$(_hm_to_secs "$start")
     end_s=$(_hm_to_secs "$end")
-    [ "$now_s" -ge "$start_s" ] && [ "$now_s" -lt "$end_s" ]
+    log "DEBUG: active_window check: now=${now_s}s start=${start_s}s end=${end_s}s window=${window}"
+    if [ "$start_s" -lt "$end_s" ]; then
+        # Normal window (e.g. 07:00-22:00)
+        [ "$now_s" -ge "$start_s" ] && [ "$now_s" -lt "$end_s" ]
+    else
+        # Midnight-crossing window (e.g. 22:00-06:00)
+        [ "$now_s" -ge "$start_s" ] || [ "$now_s" -lt "$end_s" ]
+    fi
 }
 
 seconds_until_next_active() {
     local window="${ACTIVE_HOURS:-00:00-23:59}"
-    local start
+    local start end
     start=$(echo "$window" | cut -d- -f1)
-    local now_s start_s
+    end=$(echo "$window"   | cut -d- -f2)
+    local now_s start_s end_s
     now_s=$(_now_secs)
     start_s=$(_hm_to_secs "$start")
-    local diff=$(( start_s - now_s ))
-    if [ "$diff" -gt 0 ]; then
-        echo "$diff"
+    end_s=$(_hm_to_secs "$end")
+    local diff
+    if [ "$start_s" -lt "$end_s" ]; then
+        # Normal window: next open is tomorrow's start.
+        diff=$(( start_s - now_s ))
+        [ "$diff" -le 0 ] && diff=$(( 86400 + diff ))
     else
-        echo $(( 86400 + diff ))
+        # Midnight-crossing window: active from start→midnight→end.
+        # If we're between end and start (i.e. currently inactive), sleep until start.
+        diff=$(( start_s - now_s ))
+        [ "$diff" -le 0 ] && diff=$(( 86400 + diff ))
     fi
+    log "DEBUG: seconds_until_next_active=${diff}s (window=${window} now=${now_s}s)"
+    echo "$diff"
 }
 
 _seconds_until_next_refresh_time() {
@@ -488,6 +620,36 @@ _seconds_until_next_refresh_time() {
         done
     fi
     echo "$min_secs"
+}
+
+seconds_until_next_scheduled_refresh() {
+    local times="${REFRESH_TIMES:-}"
+    [ -z "$times" ] && echo 0 && return
+
+    local now_s min_secs found day_offset
+    now_s=$(_now_secs)
+    min_secs=999999
+    found=0
+
+    for day_offset in 0 1 2 3 4 5 6 7; do
+        _is_active_day_offset "$day_offset" || continue
+        for _t in $(echo "$times" | tr ',' ' '); do
+            local t_s diff
+            t_s=$(_hm_to_secs "$_t")
+            _time_in_active_window_secs "$t_s" || continue
+            diff=$(( day_offset * 86400 + t_s - now_s ))
+            if [ "$diff" -gt 0 ] && [ "$diff" -lt "$min_secs" ]; then
+                min_secs=$diff
+                found=1
+            fi
+        done
+    done
+
+    if [ "$found" = "1" ]; then
+        echo "$min_secs"
+    else
+        seconds_until_next_active
+    fi
 }
 
 get_next_refresh_seconds() {
@@ -549,8 +711,9 @@ _load_config() {
 }
 
 # ─── Exit watchers: power button + screen tap ───────────────────────────────
-# Spawns two background processes that send SIGTERM to the daemon when the
-# user presses the power button or taps the screen.
+# Power button exits immediately. A screen tap instead shows a confirmation
+# prompt; the daemon only quits if the screen is tapped again within
+# QUIT_PROMPT_TIMEOUT seconds, otherwise the dashboard resumes.
 _find_touch_dev() {
     for _d in /dev/input/event*; do
         local _name
@@ -563,21 +726,98 @@ _find_touch_dev() {
     echo "/dev/input/event1"
 }
 
+# Discard any queued touch events for ~1s. A single physical tap emits a burst
+# of input events; draining prevents the confirm read from firing instantly on
+# leftover events from the same tap (also acts as a debounce).
+_drain_touch() {
+    local _tdev="$1"
+    ( dd if="$_tdev" of=/dev/null bs=64 2>/dev/null ) &
+    local _p=$!
+    sleep 1
+    kill "$_p" 2>/dev/null
+    wait "$_p" 2>/dev/null
+}
+
+# Show the "tap again to quit" confirmation screen.
+_display_quit_prompt() {
+    local timeout="$1"
+    eips -c
+    _eips_put 0 4 "KindleTRMNL"
+    _eips_put 0 6 "Tap again within ${timeout}s to QUIT."
+    _eips_put 0 8 "Otherwise the dashboard resumes."
+}
+
+# Wait up to "timeout" seconds for a confirming tap.
+# Returns 0 if the screen was tapped, 1 if it timed out.
+_wait_touch_confirm() {
+    local _tdev="$1" timeout="$2"
+    dd if="$_tdev" bs=16 count=1 >/dev/null 2>&1 &
+    local _ddpid=$!
+    local _i=0
+    while [ "$_i" -lt "$timeout" ]; do
+        kill -0 "$_ddpid" 2>/dev/null || return 0   # dd exited => tap received
+        sleep 1
+        _i=$(( _i + 1 ))
+    done
+    kill "$_ddpid" 2>/dev/null
+    wait "$_ddpid" 2>/dev/null
+    return 1
+}
+
+# Background loop: on each tap, prompt for quit confirmation. Quit on a second
+# tap within the timeout; otherwise redraw the dashboard and keep watching.
+_touch_watcher() {
+    local _dpid="$1" _tdev="$2"
+    local timeout="${QUIT_PROMPT_TIMEOUT:-10}"
+    while true; do
+        # Block until the screen is touched.
+        dd if="$_tdev" bs=16 count=1 >/dev/null 2>&1 || return
+        _drain_touch "$_tdev"
+        # Mark a quit prompt as active so the main loop won't deep-sleep over
+        # it (which would freeze the screen on the prompt).
+        : > "$PROMPT_LOCK" 2>/dev/null
+        log "INFO: Screen tapped -- showing quit prompt (${timeout}s)"
+        _display_quit_prompt "$timeout"
+        if _wait_touch_confirm "$_tdev" "$timeout"; then
+            log "INFO: Quit confirmed by tap -- exiting"
+            rm -f "$PROMPT_LOCK" 2>/dev/null
+            kill -TERM "$_dpid" 2>/dev/null
+            return
+        fi
+        log "INFO: Quit prompt timed out -- resuming dashboard"
+        [ -f "$FETCH_TMP" ] && display_image "$FETCH_TMP" >/dev/null 2>&1
+        rm -f "$PROMPT_LOCK" 2>/dev/null
+    done
+}
+
+# Block while a quit prompt is on screen, so the daemon doesn't go back to
+# sleep and freeze the display on the "tap again to quit" prompt. Caps the
+# wait so a stale lock can never hang the daemon indefinitely.
+_wait_prompt_clear() {
+    local _max="${PROMPT_WAIT_MAX:-30}" _i=0
+    while [ -f "$PROMPT_LOCK" ] && [ "$_i" -lt "$_max" ]; do
+        sleep 1
+        _i=$(( _i + 1 ))
+    done
+}
+
 _start_exit_watchers() {
     local _dpid="$$"
 
-    # Power button: fires when device is about to sleep.
-    ( lipc-wait-event com.lab126.powerd goingToSleep >/dev/null 2>&1
-      log "INFO: goingToSleep event -- exiting"
-      kill -TERM "$_dpid" 2>/dev/null ) &
+    # Optional power-button exit watcher. Disabled by default because in
+    # deep_sleep/hybrid workflows the same sleep event can occur during normal
+    # suspend cycles, which would terminate the daemon unexpectedly.
+    if [ "${EXIT_ON_POWER_BUTTON:-false}" = "true" ]; then
+        ( lipc-wait-event com.lab126.powerd goingToSleep >/dev/null 2>&1
+          log "INFO: goingToSleep event -- exiting"
+          kill -TERM "$_dpid" 2>/dev/null ) &
+    fi
 
-    # Screen tap: read one input event from the touchscreen device.
+    # Screen tap: show a quit-confirmation prompt instead of exiting outright.
     local _tdev
     _tdev=$(_find_touch_dev)
     if [ -r "$_tdev" ]; then
-        ( dd if="$_tdev" bs=16 count=1 >/dev/null 2>&1
-          log "INFO: Touch event -- exiting"
-          kill -TERM "$_dpid" 2>/dev/null ) &
+        _touch_watcher "$_dpid" "$_tdev" &
     fi
 }
 
@@ -589,13 +829,32 @@ _do_refresh() {
     log "INFO: Fetching from $BYOS_URL ..."
     local result
 
+    # Remember whether the radio was off (airplane mode) so we can restore it
+    # afterwards. wifi_enable will toggle wirelessEnable on regardless.
+    local _prev_radio
+    _prev_radio=$(wifi_radio_state)
+    local _was_airplane=0
+    log "DEBUG: _do_refresh: radio_state=${_prev_radio} batt=$(get_battery_pct)% mode=${POWER_MODE:-hybrid}"
+    if [ "$_prev_radio" = "0" ]; then
+        _was_airplane=1
+        log "INFO: Device in airplane mode -- temporarily enabling WiFi"
+    fi
+
     if wifi_enable; then
         fetch_display_image
         result=$?
+        log "DEBUG: _do_refresh: fetch_display_image exited with code $result"
     else
-        log "WARN: WiFi did not associate within ${WIFI_TIMEOUT:-30}s -- using cache"
+        log "WARN: WiFi did not associate within ${WIFI_TIMEOUT:-60}s -- using cache"
         _fetch_use_cache
         result=$?
+    fi
+
+    # Restore airplane mode immediately once the fetch is done. The image is
+    # already cached locally, so display below needs no network.
+    if [ "$_was_airplane" = "1" ]; then
+        log "INFO: Restoring airplane mode"
+        wifi_disable
     fi
 
     case "$result" in
@@ -633,6 +892,7 @@ _do_refresh() {
 _wait_for_next_refresh() {
     local total_secs="$1"
     local mode="${POWER_MODE:-hybrid}"
+    log "DEBUG: _wait_for_next_refresh: ${total_secs}s mode=$mode"
 
     # deep_sleep mode: set RTC alarm and suspend between refreshes.
     if [ "$mode" = "deep_sleep" ] && [ "$total_secs" -gt 90 ]; then
@@ -641,17 +901,20 @@ _wait_for_next_refresh() {
         schedule_rtc_wake "$total_secs"
         deep_sleep
         # -- resumes here after RTC wake --
+        log "INFO: Resumed from deep_sleep inter-refresh suspend"
         prevent_sleep
         sleep 3   # let system settle
         return
     fi
 
     # always_on / hybrid: sleep in 1s increments so SIGTERM interrupts promptly.
+    log "DEBUG: _wait_for_next_refresh: polling sleep (${total_secs}s)"
     local _i=0
     while [ "$_i" -lt "$total_secs" ]; do
         sleep 1
         _i=$(( _i + 1 ))
     done
+    log "DEBUG: _wait_for_next_refresh: poll complete"
 }
 
 # ─── Daemon: main loop ───────────────────────────────────────────────────────
@@ -700,8 +963,19 @@ _run_daemon() {
     hide_status_bar
     _start_exit_watchers
 
-    # Always display once on first start, then honour the schedule thereafter.
-    local _first_run=1
+    # Always do one immediate refresh at daemon start so the user sees a
+    # current dashboard right away, even when outside ACTIVE_HOURS.
+    local _startup_refreshed=0
+    log "INFO: Startup bootstrap refresh: fetching initial display"
+    if _do_refresh; then
+        _startup_refreshed=1
+    fi
+
+    # Match normal post-refresh WiFi policy after bootstrap fetch.
+    local _startup_mode="${POWER_MODE:-hybrid}"
+    if [ "$_startup_mode" != "always_on" ] || ! is_charging; then
+        wifi_disable
+    fi
 
     while true; do
         # ── Battery safety check ──────────────────────────────────────────────
@@ -717,9 +991,8 @@ _run_daemon() {
 
         local mode="${POWER_MODE:-hybrid}"
 
-        # ── Outside active window? (first start always displays once) ─────────
-        if [ "$_first_run" != "1" ] && [ "$mode" != "always_on" ] && ! is_in_active_window; then
-
+        # ── Outside active window? ────────────────────────────────────────────
+        if [ "$mode" != "always_on" ] && ! is_in_active_window; then
             log "INFO: Outside active window -- sleeping"
             wifi_disable
             allow_sleep
@@ -729,7 +1002,11 @@ _run_daemon() {
             fi
 
             local sleep_secs
-            sleep_secs=$(seconds_until_next_active)
+            if [ -n "${REFRESH_TIMES:-}" ]; then
+                sleep_secs=$(seconds_until_next_scheduled_refresh)
+            else
+                sleep_secs=$(seconds_until_next_active)
+            fi
 
             if [ "$sleep_secs" -gt 120 ]; then
                 log "INFO: RTC sleep for ${sleep_secs}s -- wakes at $(next_refresh_time_str)"
@@ -738,7 +1015,24 @@ _run_daemon() {
                 # resumes after RTC/button wake
                 log "INFO: Woke from outside-window sleep"
                 prevent_sleep
-                sleep 3
+                sleep 3   # let the input subsystem settle / quit prompt appear
+                # A button/tap wake may have triggered the quit prompt. Redraw
+                # the dashboard so the screen returns to it (not a blanked or
+                # stale screen), and wait for any in-progress quit prompt to
+                # resolve before proceeding.
+                [ -f "$FETCH_TMP" ] && display_image "$FETCH_TMP" >/dev/null 2>&1
+                _wait_prompt_clear
+
+                # Fetch out-of-hours only if we woke early and are STILL outside
+                # the active window (typically a manual wake). If wake reached
+                # active hours, normal in-window logic below handles refresh.
+                if ! is_in_active_window; then
+                    log "INFO: Woke outside active window -- one out-of-hours refresh"
+                    _do_refresh
+                    if [ "$mode" != "always_on" ] || ! is_charging; then
+                        wifi_disable
+                    fi
+                fi
             else
                 sleep "$sleep_secs"
             fi
@@ -747,21 +1041,16 @@ _run_daemon() {
 
         # ── Inside active window — fetch and display ──────────────────────────
         prevent_sleep
-        _do_refresh
+        if [ "$_startup_refreshed" = "1" ]; then
+            log "DEBUG: Skipping duplicate immediate refresh after startup bootstrap"
+            _startup_refreshed=0
+        else
+            _do_refresh
+        fi
 
         # After fetch, turn off WiFi unless always_on AND charging.
         if [ "$mode" != "always_on" ] || ! is_charging; then
             wifi_disable
-        fi
-
-        # If this was the forced first-start refresh and we are actually
-        # outside the active window, loop back so the daemon deep-sleeps
-        # until the window opens instead of busy-waiting here.
-        if [ "$_first_run" = "1" ]; then
-            _first_run=0
-            if [ "$mode" != "always_on" ] && ! is_in_active_window; then
-                continue
-            fi
         fi
 
         # ── Wait until next refresh ───────────────────────────────────────────
@@ -788,6 +1077,7 @@ _daemon_cleanup() {
     show_status_bar
     allow_sleep
     wifi_disable
+    rm -f "$PROMPT_LOCK" 2>/dev/null
     rm -f "$LOCK_FILE"     # remove lock before kill 0 can cut us short
     if [ "$_STOP_FRAMEWORK" = "1" ]; then
         # Restart the framework; it will take the user back to the home screen.

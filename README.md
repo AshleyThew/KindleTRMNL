@@ -57,9 +57,9 @@ start kindle-trmnl     # start now, or just reboot
 
 Launch from KUAL:
 
-| Menu item | Description |
-|---|---|
-| **TRMNL → Start TRMNL** | Start the dashboard (keeps the Kindle framework running). |
+| Menu item                              | Description                                                                                                    |
+| -------------------------------------- | -------------------------------------------------------------------------------------------------------------- |
+| **TRMNL → Start TRMNL**                | Start the dashboard (keeps the Kindle framework running).                                                      |
 | **TRMNL → Start TRMNL (no framework)** | Stop the Kindle GUI framework first for maximum framebuffer control. Best for a dedicated always-on dashboard. |
 
 To **exit**, press the power button or tap the screen — the daemon restores the
@@ -70,22 +70,23 @@ status bar / framework and returns to the home screen.
 All settings live in `config.conf`. Edit the file, then restart from KUAL for
 changes to take effect.
 
-| Key | Default | Description |
-|---|---|---|
-| `BYOS_URL` | — | Your BYOS server URL, no trailing slash. **Required.** |
-| `API_KEY` | — | Device access token (sent as the `access-token` header). **Required.** |
-| `POWER_MODE` | `hybrid` | `always_on`, `deep_sleep`, or `hybrid`. |
-| `ACTIVE_HOURS` | `07:00-22:00` | Active window (`HH:MM-HH:MM`) for `hybrid` mode. |
-| `REFRESH_TIMES` | `08:00,12:00,17:00,20:00` | Comma-separated clock times to refresh. Leave empty to use the interval instead. |
-| `REFRESH_INTERVAL` | `900` | Seconds between refreshes when `REFRESH_TIMES` is empty. |
-| `REFRESH_DAYS` | (all) | ISO weekday numbers (`1`=Mon … `7`=Sun). Blank = every day. |
-| `LOW_BATTERY_THRESHOLD` | `15` | Daemon stops below this % when not charging. |
-| `DISPLAY_BATTERY` | `true` | Show a battery / last / next status line after each update. |
-| `BLANK_OUTSIDE_HOURS` | `false` | Blank the screen outside active hours instead of showing the last image. |
-| `PARTIAL_REFRESH` | `false` | Use partial e-ink refresh (faster, may ghost). |
-| `WIFI_TIMEOUT` | `30` | Seconds to wait for WiFi before falling back to cache. |
-| `LOG_MAX_BYTES` | `524288` | Log file rotates above this size (512 KB). |
-| `STOP_FRAMEWORK` | `false` | Stop the Kindle GUI framework on start (same as the "no framework" menu item). |
+| Key                     | Default                   | Description                                                                      |
+| ----------------------- | ------------------------- | -------------------------------------------------------------------------------- |
+| `BYOS_URL`              | —                         | Your BYOS server URL, no trailing slash. **Required.**                           |
+| `API_KEY`               | —                         | Device access token (sent as the `access-token` header). **Required.**           |
+| `POWER_MODE`            | `hybrid`                  | `always_on`, `deep_sleep`, or `hybrid`.                                          |
+| `ACTIVE_HOURS`          | `07:00-22:00`             | Active window (`HH:MM-HH:MM`) for `hybrid` mode.                                 |
+| `REFRESH_TIMES`         | `08:00,12:00,17:00,20:00` | Comma-separated clock times to refresh. Leave empty to use the interval instead. |
+| `REFRESH_INTERVAL`      | `900`                     | Seconds between refreshes when `REFRESH_TIMES` is empty.                         |
+| `REFRESH_DAYS`          | (all)                     | ISO weekday numbers (`1`=Mon … `7`=Sun). Blank = every day.                      |
+| `LOW_BATTERY_THRESHOLD` | `15`                      | Daemon stops below this % when not charging.                                     |
+| `DISPLAY_BATTERY`       | `true`                    | Show a battery / last / next status line after each update.                      |
+| `BLANK_OUTSIDE_HOURS`   | `false`                   | Blank the screen outside active hours instead of showing the last image.         |
+| `PARTIAL_REFRESH`       | `false`                   | Use partial e-ink refresh (faster, may ghost).                                   |
+| `QUIT_PROMPT_TIMEOUT`   | `10`                      | Seconds to wait for second tap before dismissing quit prompt.                    |
+| `WIFI_TIMEOUT`          | `60`                      | Seconds to wait for WiFi to associate and obtain an IP before falling back to cache. |
+| `LOG_MAX_BYTES`         | `524288`                  | Log file rotates above this size (512 KB).                                       |
+| `STOP_FRAMEWORK`        | `false`                   | Stop the Kindle GUI framework on start (same as the "no framework" menu item).   |
 
 ### Power modes
 
