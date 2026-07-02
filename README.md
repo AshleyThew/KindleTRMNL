@@ -83,6 +83,7 @@ changes to take effect.
 | `DISPLAY_BATTERY`       | `true`                    | Show a battery / last / next status line after each update.                      |
 | `BLANK_OUTSIDE_HOURS`   | `false`                   | Blank the screen outside active hours instead of showing the last image.         |
 | `PARTIAL_REFRESH`       | `false`                   | Use partial e-ink refresh (faster, may ghost).                                   |
+| `FULL_REFRESH_PASSES`   | `2`                       | Number of full clear passes per redraw when partial refresh is off (less ghosting, more flicker). |
 | `QUIT_PROMPT_TIMEOUT`   | `10`                      | Seconds to wait for second tap before dismissing quit prompt.                    |
 | `WIFI_TIMEOUT`          | `60`                      | Seconds to wait for WiFi to associate and obtain an IP before falling back to cache. |
 | `LOG_MAX_BYTES`         | `524288`                  | Log file rotates above this size (512 KB).                                       |

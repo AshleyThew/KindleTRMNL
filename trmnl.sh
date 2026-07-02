@@ -81,9 +81,25 @@ _wifi_has_ip() {
             fi
         fi
     done
-    log "DEBUG: _wifi_has_ip: no interface has IPv4 address"
     return 1
 }
+
+# Assert WiFi ON via LIPC property set (KOReader-proven minimal pattern).
+# -i flag REQUIRED for integer properties (c.f. KOReader #6019).
+_wifi_assert_on() {
+    lipc-set-prop -i com.lab126.cmd wirelessEnable 1 2>/dev/null
+    lipc-set-prop -i com.lab126.wifid enable 1 2>/dev/null
+}
+
+_wifi_assert_off() {
+    # Only turn off the radio — do NOT disable wifid itself.
+    # Disabling wifid tears down the kernel interface (wlan0 disappears from
+    # /sys/class/net/), which means wifid cannot reconnect on the next wake
+    # even when wirelessEnable is set back to 1.
+    lipc-set-prop -i com.lab126.cmd wirelessEnable 0 2>/dev/null
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
 
 wifi_enable() {
     log "DEBUG: wifi_enable called (radio=$(wifi_radio_state))"
@@ -93,63 +109,33 @@ wifi_enable() {
         return 0
     fi
 
-    # Turn the radio on. This is idempotent: re-issuing it while already on does
-    # not disrupt an in-progress association, so we can safely re-assert it
-    # below without ever cutting power mid-connect.
-    log "INFO: WiFi enable: asserting wirelessEnable=1"
-    lipc-set-prop com.lab126.cmd wirelessEnable 1 2>/dev/null
+    log "DEBUG: wifi_enable: asserting WiFi ON"
+    _wifi_assert_on
 
     local timeout="${WIFI_TIMEOUT:-60}"
     local elapsed=0
+    
     while [ "$elapsed" -lt "$timeout" ]; do
-        local iface
-        iface=$(lipc-get-prop com.lab126.cmd activeInterface 2>/dev/null)
-        if [ "$iface" = "wifi" ]; then
-            # Interface is selected, but the connection may not be fully
-            # established (no IP yet). Require a CONNECTED cmState (when the
-            # daemon exposes it) AND a real IPv4 address before proceeding.
-            local cmstate
-            cmstate=$(lipc-get-prop com.lab126.wifid cmState 2>/dev/null)
-            log "DEBUG: wifi_enable: elapsed=${elapsed}s iface=$iface cmState='${cmstate}'"
-            case "$cmstate" in
-                CONNECTED|[Cc][Oo][Nn][Nn][Ee][Cc][Tt][Ee][Dd]|'') # '' = daemon doesn't expose cmState; accept iface=wifi
-                    if _wifi_has_ip; then
-                        # Some devices report "connected" before the network
-                        # stack is ready for HTTP. Give it a moment to settle so
-                        # the first fetch doesn't fall back to the cached image.
-                        local settle="${NETWORK_SETTLE_SECS:-2}"
-                        [ "$settle" -gt 0 ] 2>/dev/null && sleep "$settle"
-                        log "INFO: WiFi connected (${elapsed}s, settle=${settle}s)"
-                        return 0
-                    fi
-                    ;;
-                *)
-                    log "DEBUG: wifi_enable: cmState='$cmstate' -- waiting"
-                    ;;
-            esac
-        else
-            log "DEBUG: wifi_enable: elapsed=${elapsed}s activeInterface='${iface}' (not wifi yet)"
-        fi
-
-        # Periodically re-assert the radio enable in case it was disabled
-        # (e.g. by a power-save event). This does NOT power-cycle the radio, so
-        # it never interrupts an association that is already underway.
-        if [ $(( elapsed % 10 )) -eq 0 ] && [ "$elapsed" -gt 0 ]; then
-            log "DEBUG: wifi_enable: re-asserting wirelessEnable=1 at ${elapsed}s"
-            lipc-set-prop com.lab126.cmd wirelessEnable 1 2>/dev/null
+        # Poll for actual IP on a wireless interface as source of truth.
+        if _wifi_has_ip; then
+            local settle
+            settle="${NETWORK_SETTLE_SECS:-2}"
+            [ "$settle" -gt 0 ] 2>/dev/null && sleep "$settle"
+            log "INFO: WiFi connected (${elapsed}s)"
+            return 0
         fi
 
         sleep 2
         elapsed=$(( elapsed + 2 ))
     done
 
-    log "WARN: WiFi did not connect within ${timeout}s (last iface=$(lipc-get-prop com.lab126.cmd activeInterface 2>/dev/null) cmState=$(lipc-get-prop com.lab126.wifid cmState 2>/dev/null))"
+    log "WARN: WiFi did not connect within ${timeout}s"
     return 1
 }
 
 wifi_disable() {
     log "DEBUG: wifi_disable called"
-    lipc-set-prop com.lab126.cmd wirelessEnable 0 2>/dev/null
+    _wifi_assert_off
 }
 
 # Report the current radio state: "1" = wireless enabled, "0" = off/airplane
@@ -263,7 +249,40 @@ is_charging() {
 schedule_rtc_wake() {
     local seconds="$1"
     log "DEBUG: schedule_rtc_wake: ${seconds}s from now"
+
+    # Primary path: ask powerd to arm an RTC wake.
     lipc-set-prop com.lab126.powerd rtcWakeup "$seconds" 2>/dev/null
+
+    # Reliability fallback: also arm the kernel RTC wakealarm directly.
+    # Some firmware builds expose rtcWakeup but do not always honor it.
+    local _wa _now _target
+    _wa=""
+    for _cand in /sys/class/rtc/rtc0/wakealarm /sys/class/rtc/rtc1/wakealarm; do
+        if [ -w "$_cand" ]; then
+            _wa="$_cand"
+            break
+        fi
+    done
+
+    if [ -n "$_wa" ]; then
+        _now=$(date +%s 2>/dev/null)
+        case "$_now" in
+            ''|*[!0-9]*)
+                log "WARN: schedule_rtc_wake: date +%s failed; kernel wakealarm not set"
+                ;;
+            *)
+                _target=$(( _now + seconds ))
+                echo 0 > "$_wa" 2>/dev/null
+                if echo "$_target" > "$_wa" 2>/dev/null; then
+                    log "DEBUG: schedule_rtc_wake: kernel wakealarm set ($_wa -> epoch $_target)"
+                else
+                    log "WARN: schedule_rtc_wake: failed writing kernel wakealarm ($_wa)"
+                fi
+                ;;
+        esac
+    else
+        log "DEBUG: schedule_rtc_wake: no writable /sys/class/rtc/*/wakealarm path"
+    fi
 }
 
 deep_sleep() {
@@ -306,10 +325,25 @@ display_image() {
         display_error "No image file" "Path: $path"
         return 1
     fi
-    eips -c
     if [ "${PARTIAL_REFRESH:-false}" = "true" ]; then
+        # Fast path: minimal flashing, may ghost on some panels.
+        eips -c
         eips -g "$path" -x 0 -y 0
     else
+        # Stronger full refresh path to reduce retained ghosting.
+        local passes i
+        passes="${FULL_REFRESH_PASSES:-2}"
+        case "$passes" in
+            ''|*[!0-9]*) passes=2 ;;
+        esac
+        [ "$passes" -lt 1 ] && passes=1
+        [ "$passes" -gt 4 ] && passes=4
+        i=1
+        while [ "$i" -le "$passes" ]; do
+            eips -f -c
+            usleep 80000 2>/dev/null
+            i=$(( i + 1 ))
+        done
         eips -f -g "$path" -x 0 -y 0
     fi
 }
@@ -348,6 +382,8 @@ display_battery_overlay() {
     fi
     local status_line="Batt:${batt}%  Last:${last}  Next:${nxt}"
     log "DEBUG: battery_overlay row=${bottom_row} line='${status_line}'"
+    # Clear the entire row first so shorter updates don't leave stale chars.
+    _eips_put 0 "$bottom_row" "                                                                                "
     _eips_put 0 "$bottom_row" "$status_line"
 }
 
@@ -833,12 +869,7 @@ _do_refresh() {
     # afterwards. wifi_enable will toggle wirelessEnable on regardless.
     local _prev_radio
     _prev_radio=$(wifi_radio_state)
-    local _was_airplane=0
     log "DEBUG: _do_refresh: radio_state=${_prev_radio} batt=$(get_battery_pct)% mode=${POWER_MODE:-hybrid}"
-    if [ "$_prev_radio" = "0" ]; then
-        _was_airplane=1
-        log "INFO: Device in airplane mode -- temporarily enabling WiFi"
-    fi
 
     if wifi_enable; then
         fetch_display_image
@@ -852,8 +883,10 @@ _do_refresh() {
 
     # Restore airplane mode immediately once the fetch is done. The image is
     # already cached locally, so display below needs no network.
-    if [ "$_was_airplane" = "1" ]; then
-        log "INFO: Restoring airplane mode"
+    # In deep_sleep mode, skip wifi_disable here too — the main loop and kernel
+    # suspend handle radio power without unloading the driver.
+    if [ "${POWER_MODE:-hybrid}" != "deep_sleep" ]; then
+        log "INFO: Disabling WiFi after fetch"
         wifi_disable
     fi
 
@@ -921,7 +954,11 @@ _wait_for_next_refresh() {
 _run_daemon() {
     _check_dependencies
 
-    # Singleton: use tmp+mv to minimise (not eliminate) race window.
+    # Exit if device is in airplane mode at startup. We only manage WiFi enable/disable.
+    if [ "$(lipc-get-prop -i com.lab126.cmd airplaneMode 2>/dev/null)" = "1" ]; then
+        log "WARN: Device in airplane mode at startup -- exiting"
+        exit 0
+    fi
     if [ -f "$LOCK_FILE" ]; then
         local existing
         existing=$(cat "$LOCK_FILE" 2>/dev/null)
@@ -972,8 +1009,12 @@ _run_daemon() {
     fi
 
     # Match normal post-refresh WiFi policy after bootstrap fetch.
+    # In deep_sleep mode we do NOT disable WiFi before sleeping — the kernel
+    # suspend powers down the radio automatically, and calling wirelessEnable 0
+    # unloads the driver, leaving no interface on wake.
     local _startup_mode="${POWER_MODE:-hybrid}"
-    if [ "$_startup_mode" != "always_on" ] || ! is_charging; then
+    if [ "$_startup_mode" != "deep_sleep" ] && \
+       ([ "$_startup_mode" != "always_on" ] || ! is_charging); then
         wifi_disable
     fi
 
@@ -994,7 +1035,12 @@ _run_daemon() {
         # ── Outside active window? ────────────────────────────────────────────
         if [ "$mode" != "always_on" ] && ! is_in_active_window; then
             log "INFO: Outside active window -- sleeping"
-            wifi_disable
+            # Only disable WiFi here for non-deep_sleep modes. In deep_sleep,
+            # the kernel suspend powers off the radio; explicitly disabling first
+            # would unload the driver and break reconnection after wake.
+            if [ "$mode" != "deep_sleep" ]; then
+                wifi_disable
+            fi
             allow_sleep
 
             if [ "${BLANK_OUTSIDE_HOURS:-false}" = "true" ]; then
@@ -1023,15 +1069,13 @@ _run_daemon() {
                 [ -f "$FETCH_TMP" ] && display_image "$FETCH_TMP" >/dev/null 2>&1
                 _wait_prompt_clear
 
-                # Fetch out-of-hours only if we woke early and are STILL outside
-                # the active window (typically a manual wake). If wake reached
-                # active hours, normal in-window logic below handles refresh.
-                if ! is_in_active_window; then
-                    log "INFO: Woke outside active window -- one out-of-hours refresh"
-                    _do_refresh
-                    if [ "$mode" != "always_on" ] || ! is_charging; then
-                        wifi_disable
-                    fi
+                # Always attempt one refresh after any wake so manual wakeups
+                # update the dashboard immediately, even outside active hours.
+                log "INFO: Woke from sleep -- running immediate refresh"
+                _do_refresh
+                if [ "$mode" != "deep_sleep" ] && \
+                   ([ "$mode" != "always_on" ] || ! is_charging); then
+                    wifi_disable
                 fi
             else
                 sleep "$sleep_secs"
@@ -1049,7 +1093,10 @@ _run_daemon() {
         fi
 
         # After fetch, turn off WiFi unless always_on AND charging.
-        if [ "$mode" != "always_on" ] || ! is_charging; then
+        # In deep_sleep mode, skip this — the kernel suspend handles radio power,
+        # and explicitly disabling unloads the driver (no interface on wake).
+        if [ "$mode" != "deep_sleep" ] && \
+           ([ "$mode" != "always_on" ] || ! is_charging); then
             wifi_disable
         fi
 
